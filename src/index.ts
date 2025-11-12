@@ -41,6 +41,9 @@ const timeline = drawingLayer.append("div").attr("class", "timeline");
 const markingOverlay = modContainer.append("div").attr("id", "markingOverlay").attr("class", "inactiveMarking");
 
 let selection: Rect = { x1: 0, y1: 0, x2: 0, y2: 0 };
+let zoomLevel = 1.0;
+let currentDataView: DataView | null = null;
+let currentWindowSize: Spotfire.Size | null = null;
 
 window.Spotfire.initialize(async (mod) => {
     /**
@@ -51,11 +54,10 @@ window.Spotfire.initialize(async (mod) => {
 
     let fontSize = parseInt(context.styling.general.font.fontSize.toString()); // workaround bug in Spotfire 11.4 where fontSize returns string
 
-    let cardHeight = fontSize * rowsPerCard * 1.5;
-    let timelineLevelHeight = fontSize * 2;
-    let minimumTimeSegmentWidth = fontSize * 4;
-    let cardWidth = 3.2 * minimumTimeSegmentWidth;
-    let timeSegmentMargin = cardWidth / 2;
+    let baseCardHeight = fontSize * rowsPerCard * 1.5;
+    let baseTimelineLevelHeight = fontSize * 2;
+    let baseMinimumTimeSegmentWidth = fontSize * 4;
+    let baseCardWidth = 3.2 * baseMinimumTimeSegmentWidth;
     let autoScroll = false;
     let autoScrollSpeed = 5;
 
@@ -73,7 +75,131 @@ window.Spotfire.initialize(async (mod) => {
         mod.controls.errorOverlay.show(err);
     });
 
+    // Setup smooth mouse wheel zoom on timeline (x-axis only)
+    let scrollTimeout: number | null = null;
+    let indicatorTimeout: number | null = null;
+    let isZooming = false;
+    const containerElement = modContainer.node() as HTMLElement;
+    const zoomIndicator = document.getElementById("zoom-indicator");
+    
+    const zoomInstructions = document.getElementById("zoom-instructions");
+    let hasUsedZoom = false;
+    
+    function showZoomIndicator() {
+        if (!zoomIndicator) return;
+        
+        // Hide instructions after first use
+        if (!hasUsedZoom && zoomInstructions) {
+            hasUsedZoom = true;
+            setTimeout(() => {
+                if (zoomInstructions) {
+                    zoomInstructions.style.opacity = '0';
+                    setTimeout(() => {
+                        if (zoomInstructions) {
+                            zoomInstructions.style.display = 'none';
+                        }
+                    }, 300);
+                }
+            }, 2000);
+        }
+        
+        const zoomPercent = Math.round(zoomLevel * 100);
+        let aggregationLevel = "All Details";
+        
+        if (zoomLevel < 0.3) {
+            aggregationLevel = "Yearly View";
+        } else if (zoomLevel < 0.6) {
+            aggregationLevel = "Quarterly View";
+        } else if (zoomLevel < 1.0) {
+            aggregationLevel = "Monthly View";
+        } else if (zoomLevel >= 2.0) {
+            aggregationLevel = "Daily View";
+        }
+        
+        zoomIndicator.textContent = `Zoom: ${zoomPercent}% • ${aggregationLevel}`;
+        zoomIndicator.classList.add("visible");
+        
+        if (indicatorTimeout !== null) {
+            clearTimeout(indicatorTimeout);
+        }
+        
+        indicatorTimeout = window.setTimeout(() => {
+            zoomIndicator.classList.remove("visible");
+            indicatorTimeout = null;
+        }, 1500);
+    }
+    
+    if (containerElement) {
+        containerElement.addEventListener("wheel", (event: WheelEvent) => {
+            // Check if Ctrl/Cmd is held for zoom, otherwise allow normal scroll
+            if (event.ctrlKey || event.metaKey) {
+                event.preventDefault();
+                event.stopPropagation();
+                
+                if (isZooming || !currentDataView || !currentWindowSize) {
+                    return;
+                }
+                
+                // Calculate zoom point relative to viewport
+                const rect = containerElement.getBoundingClientRect();
+                const mouseX = event.clientX - rect.left;
+                const scrollLeft = containerElement.scrollLeft;
+                const zoomPointX = scrollLeft + mouseX;
+                
+                // Smoother zoom with smaller steps
+                const zoomDelta = event.deltaY < 0 ? 0.05 : -0.05;
+                const oldZoomLevel = zoomLevel;
+                zoomLevel = Math.max(0.2, Math.min(10.0, zoomLevel + zoomDelta));
+                
+                // Only re-render if zoom actually changed
+                if (Math.abs(oldZoomLevel - zoomLevel) < 0.001) {
+                    return;
+                }
+                
+                // Show zoom indicator
+                showZoomIndicator();
+                
+                // Clear any pending timeout
+                if (scrollTimeout !== null) {
+                    clearTimeout(scrollTimeout);
+                }
+                
+                // Debounce rendering for smooth experience
+                isZooming = true;
+                scrollTimeout = window.setTimeout(() => {
+                    render(currentDataView!, currentWindowSize!).then(() => {
+                        // Maintain zoom focus point
+                        const zoomRatio = zoomLevel / oldZoomLevel;
+                        const newScrollLeft = zoomPointX * zoomRatio - mouseX;
+                        containerElement.scrollLeft = Math.max(0, newScrollLeft);
+                        
+                        isZooming = false;
+                        scrollTimeout = null;
+                    }).catch(() => {
+                        isZooming = false;
+                        scrollTimeout = null;
+                    });
+                }, 30);
+            }
+        }, { passive: false });
+        
+        // Prevent default pinch-to-zoom on trackpad
+        containerElement.addEventListener("gesturestart", (event: Event) => {
+            event.preventDefault();
+        }, { passive: false });
+        
+        containerElement.addEventListener("gesturechange", (event: Event) => {
+            event.preventDefault();
+        }, { passive: false });
+    }
+
     async function onChange(dataView: DataView, windowSize: Spotfire.Size) {
+        currentDataView = dataView;
+        currentWindowSize = windowSize;
+        await render(dataView, windowSize);
+    }
+
+    async function render(dataView: DataView, windowSize: Spotfire.Size) {
         /**
          * Get Data
          */
@@ -100,8 +226,17 @@ window.Spotfire.initialize(async (mod) => {
         /**
          * Calculate Layout
          */
+        // Apply zoom level to x-axis (timeline width) only
+        let cardHeight = baseCardHeight;
+        let timelineLevelHeight = baseTimelineLevelHeight;
+        let minimumTimeSegmentWidth = baseMinimumTimeSegmentWidth;
+        let cardWidth = baseCardWidth;
+        let timeSegmentMargin = cardWidth / 2;
+        
         let timeMarkerWidth = (windowSize.width - timeSegmentMargin * 2) / timeLeaves.length;
         timeMarkerWidth = timeMarkerWidth >= minimumTimeSegmentWidth ? timeMarkerWidth : minimumTimeSegmentWidth;
+        // Apply zoom level to x-axis only
+        timeMarkerWidth = timeMarkerWidth * zoomLevel;
         const timeSegmentsPerCard = Math.ceil((cardWidth + horizontalSpaceBetweenCards) / timeMarkerWidth);
         const timeLineTop = windowSize.height / 2 - (timelineLevelHeight * timeHierarchyDepth) / 2;
         const drawingAreaHeight = windowSize.height - 35;
@@ -176,9 +311,10 @@ window.Spotfire.initialize(async (mod) => {
         }
 
         function scroll() {
-            let currentScroll = document.body.scrollLeft;
+            if (!containerElement) return;
+            let currentScroll = containerElement.scrollLeft;
             if (autoScroll && currentScroll < timelineWidth - windowSize.width) {
-                document.body.scrollLeft = currentScroll + 1;
+                containerElement.scrollLeft = currentScroll + 1;
                 setTimeout(scroll, autoScrollSpeed);
             }
         }
@@ -233,15 +369,35 @@ window.Spotfire.initialize(async (mod) => {
         let hierarchy: d3.HierarchyNode<DataViewHierarchyNode> = d3.hierarchy(hierarchyRoot);
         hierarchy.sum((d: DataViewHierarchyNode) => (!d?.children && 1) || 0);
 
-        let partition = d3.partition().size([timelineWidth, timelineHeight]).padding(0).round(false);
+        let partition = d3.partition<DataViewHierarchyNode>().size([timelineWidth, timelineHeight]).padding(0).round(false);
         let partitionedHierarchy: d3.HierarchyRectangularNode<DataViewHierarchyNode> = partition(
-            hierarchy
+            hierarchy as any
         ) as d3.HierarchyRectangularNode<DataViewHierarchyNode>;
 
-        // remove the root node from the displayed hierarchy
+        // Automatically adjust hierarchy depth based on zoom level
+        // When zoomed out, show higher-level aggregations (years, months)
+        // When zoomed in, show detailed level (days, hours)
+        let maxDisplayLevel = timeHierarchyDepth - 1;
+        if (zoomLevel < 0.3) {
+            // Very zoomed out: show only top 1 level (e.g., years)
+            maxDisplayLevel = Math.min(0, timeHierarchyDepth - 1);
+        } else if (zoomLevel < 0.6) {
+            // Zoomed out: show top 2 levels (e.g., years, quarters)
+            maxDisplayLevel = Math.min(1, timeHierarchyDepth - 1);
+        } else if (zoomLevel < 1.0) {
+            // Normal: show top 3 levels
+            maxDisplayLevel = Math.min(2, timeHierarchyDepth - 1);
+        } else {
+            // Zoomed in: show all levels
+            maxDisplayLevel = timeHierarchyDepth - 1;
+        }
+
+        // remove the root node and filter by display level
         let displayHierarchy = partitionedHierarchy
             .descendants()
-            .filter((d: d3.HierarchyRectangularNode<DataViewHierarchyNode>) => d.parent);
+            .filter((d: d3.HierarchyRectangularNode<DataViewHierarchyNode>) => {
+                return d.parent && d.data.level <= maxDisplayLevel;
+            });
 
         timeline
             .selectAll(".timeMarker")
@@ -267,8 +423,8 @@ window.Spotfire.initialize(async (mod) => {
          */
 
         function mouseDownHandler(event: MouseEvent) {
-            let scrollLeft = document.body.scrollLeft;
-            let scrollTop = document.body.scrollTop;
+            const scrollLeft = containerElement?.scrollLeft || 0;
+            const scrollTop = containerElement?.scrollTop || 0;
             selection = {
                 x1: event.clientX + scrollLeft,
                 y1: event.clientY + scrollTop,
@@ -280,8 +436,8 @@ window.Spotfire.initialize(async (mod) => {
         }
 
         function mouseMoveHandler(event: MouseEvent) {
-            let scrollLeft = document.body.scrollLeft;
-            let scrollTop = document.body.scrollTop;
+            const scrollLeft = containerElement?.scrollLeft || 0;
+            const scrollTop = containerElement?.scrollTop || 0;
             selection.x2 = event.clientX + scrollLeft;
             selection.y2 = event.clientY + scrollTop;
 
