@@ -9,7 +9,7 @@
         "build-watch": "webpack --watch",
         "start": "npm run build-watch"
     },
-    "author": "lehtipalo",
+    "author": "Tousif Ahamed",
     "license": "BSD-3-Clause",
     "devDependencies": {
         "@tibco/spotfire-mods-dev-server": "^1.0.0",

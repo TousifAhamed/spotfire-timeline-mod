@@ -193,3 +193,47 @@ body {
     background: #555;
 }
 
+/* Performance stats overlay */
+#performance-stats {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    background: rgba(0, 0, 0, 0.8);
+    color: #00ff00;
+    padding: 10px 12px;
+    border-radius: 4px;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    pointer-events: none;
+    z-index: 1000;
+    line-height: 1.6;
+    display: none; /* Hidden by default, shown when dataset is large */
+}
+
+#performance-stats.visible {
+    display: block;
+}
+
+#performance-stats .stat-label {
+    color: #888;
+    display: inline-block;
+    width: 120px;
+}
+
+#performance-stats .stat-value {
+    color: #00ff00;
+    font-weight: bold;
+}
+
+#performance-stats .stat-good {
+    color: #00ff00;
+}
+
+#performance-stats .stat-warning {
+    color: #ffaa00;
+}
+
+#performance-stats .stat-bad {
+    color: #ff4444;
+}
+
