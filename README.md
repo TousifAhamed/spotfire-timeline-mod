@@ -5,22 +5,23 @@
 Display a list of events in chronological order to communicate time-related information, over time, either for analysis or to visually present a story or view of history.
 
 > **Forked from**: [spotfiresoftware/spotfire-mod-timeline](https://github.com/spotfiresoftware/spotfire-mod-timeline)  
-> This enhanced version includes advanced zoom capabilities, automatic time aggregation, and improved user experience.
+> This enhanced version includes advanced zoom capabilities, automatic time aggregation, and improved user experience. Maintained by [TousifAhamed](https://github.com/TousifAhamed).
 
 ## ✨ Enhanced Features
 
 This enhanced version includes professional-grade improvements for handling **huge datasets** with superior performance:
 
-### ⚡ High-Performance Architecture for Large Datasets
+### ⚡ Hyper Scale Architecture for Massive Datasets
 
 **Massive Scale Support**:
-- **50,000 Time Segments**: Increased from 2,000 to 50,000 (25x improvement)
-- **50,000 Row Limit**: Handle datasets up to 50,000 rows efficiently
+- **1,000,000 Time Segments**: Increased from 50,000 to 1,000,000 (20x improvement)
+- **1,000,000 Row Limit**: Handle datasets up to 1,000,000 rows efficiently
 - **Viewport-Based Rendering**: Only renders cards visible in current view + buffer zone
 - **Automatic Performance Mode**: Activates intelligent optimizations above 5,000 cards
 
 **Smart Rendering Engine**:
-- **Viewport Culling**: Dramatically reduces DOM nodes by rendering only visible cards
+- **Binary Search Culling**: O(log N) visibility checks for instant rendering of 1M items
+- **Strided Loop Rendering**: Mathematically skips invisible timeline nodes
 - **Dynamic Buffering**: 2x viewport width buffer prevents pop-in during scroll
 - **RequestAnimationFrame**: Smooth 60fps scrolling even with massive datasets
 - **Intelligent Data Filtering**: Filters cards before D3 rendering for maximum efficiency
@@ -67,7 +68,7 @@ This automatic aggregation reduces visual clutter and improves performance when 
 
 ## Installation & Use
 
-[Download latest version](https://github.com/spotfiresoftware/spotfire-mod-timeline/releases)
+[Download latest version](https://github.com/TousifAhamed/spotfire-timeline-mod/releases)
 
 The [Wiki](https://github.com/spotfiresoftware/spotfire-mod-timeline/wiki) contains step-by-step instruction on how to install and use this Mod in Spotfire®.
 
@@ -102,8 +103,8 @@ The development version of bundle.js is uncompressed and not suitable for end-us
 |-------------|------------------|-------------------|-------------|
 | < 1,000 cards | Normal | All cards rendered | < 20ms |
 | 1,000 - 5,000 cards | Normal | All cards rendered | 20-50ms |
-| 5,000 - 20,000 cards | **High-Performance** | Viewport culling active | 30-70ms |
-| 20,000 - 50,000 cards | **High-Performance** | Aggressive culling | 50-100ms |
+| 5,000 - 100,000 cards | **High-Performance** | Viewport culling active | 30-70ms |
+| 100,000 - 1,000,000 cards | **Hyper Scale** | Binary Search + Strided Loop | 50-100ms |
 
 ### Performance Mode Features
 
@@ -130,9 +131,9 @@ The development version of bundle.js is uncompressed and not suitable for end-us
 
 ### Maximum Limits
 
-- **Max Time Segments**: 50,000
-- **Max Rows**: 50,000
-- **Recommended for Smooth Performance**: < 20,000 cards
+- **Max Time Segments**: 1,000,000
+- **Max Rows**: 1,000,000
+- **Recommended for Smooth Performance**: < 500,000 cards
 - **Viewport Buffer**: 2x screen width (automatically adjusted)
 
 ## About Mods for Spotfire®

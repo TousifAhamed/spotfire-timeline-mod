@@ -26,7 +26,7 @@ const timeAxisName = "Time",
     verticalSpaceBetweenCards = 12.5,
     horizontalSpaceBetweenCards = 12.5,
     rowsPerCard = 2,
-    maxTimeSegments = 50000,
+    maxTimeSegments = 1000000,
     VIEWPORT_BUFFER = 2,
     PERFORMANCE_MODE_THRESHOLD = 5000;
 
@@ -50,11 +50,13 @@ const state = {
     timeLeaves: [] as DataViewHierarchyNode[],
     timeHierarchyDepth: 0,
     hierarchyRoot: null as DataViewHierarchyNode | null,
+    flatNodes: [] as HierarchyRectangularNode<DataViewHierarchyNode>[],
     isZooming: false,
     performanceMode: false,
     visibleCardCount: 0,
     viewportLeft: 0,
-    viewportRight: 0
+    viewportRight: 0,
+    renderTime: 0
 };
 
 window.Spotfire.initialize(async (mod) => {
@@ -69,15 +71,15 @@ window.Spotfire.initialize(async (mod) => {
     const autoScrollSpeed = 5;
 
     document.querySelector("#extra_styling")!.innerHTML = `
-    .body { fill: ${context.styling.general.font.color}; font-size: ${context.styling.general.font.fontSize}px; font-weight: ${context.styling.general.font.fontWeight}; font-style: ${context.styling.general.font.fontStyle};}
-    .timeMarker {border-color: ${context.styling.scales.line.stroke}} 
+    body { fill: ${context.styling.general.font.color}; font-size: ${context.styling.general.font.fontSize}px; font-weight: ${context.styling.general.font.fontWeight}; font-style: ${context.styling.general.font.fontStyle};}
+    .timeMarker {border-color: ${context.styling.scales.line.stroke}; color: ${context.styling.general.font.color}; font-size: ${context.styling.general.font.fontSize}px;} 
     .timeline {border-color: ${context.styling.scales.line.stroke}} 
     .connector {background-color: ${context.styling.scales.line.stroke}}
     `;
 
     const reader = mod.createReader(mod.visualization.data(), mod.windowSize());
 
-    reader.subscribe(generalErrorHandler(mod, 50000)(onChange), (err) => {
+    reader.subscribe(generalErrorHandler(mod, 1000000)(onChange), (err) => {
         mod.controls.errorOverlay.show(err);
     });
 
@@ -166,58 +168,240 @@ window.Spotfire.initialize(async (mod) => {
         containerElement.addEventListener("gesturechange", (e) => e.preventDefault(), { passive: false });
     }
 
-    async function onChange(dataView: DataView, windowSize: Spotfire.Size) {
+
+    /**
+     * Binary Search Helper for Cards
+     * Finds the index of the first card that is visible
+     */
+    function findCardStartIndex(cards: Card[], minPos: number): number {
+        let low = 0;
+        let high = cards.length - 1;
+        let result = 0;
+
+        while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            if (cards[mid].timePosition >= minPos) {
+                result = mid;
+                high = mid - 1;
+            } else {
+                low = mid + 1;
+            }
+        }
+        return result;
+    }
+
+    /**
+     * Binary Search Helper for Cards
+     * Finds the index of the last card that is visible
+     */
+    function findCardEndIndex(cards: Card[], maxPos: number): number {
+        let low = 0;
+        let high = cards.length - 1;
+        let result = cards.length - 1;
+
+        while (low <= high) {
+            const mid = Math.floor((low + high) / 2);
+            if (cards[mid].timePosition <= maxPos) {
+                result = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return result;
+    }
+
+    async function onChange(dataView: DataView, windowSize: Spotfire.Size, preFetchedRows?: DataViewRow[]) {
         state.dataView = dataView;
         state.windowSize = windowSize;
-        await processData(dataView);
+        await processData(dataView, preFetchedRows);
         await draw();
     }
 
-    async function processData(dataView: DataView) {
-        const hasTime = !!(await dataView.categoricalAxis(timeAxisName));
-        const hasDescription = !!(await dataView.categoricalAxis(descriptionAxisName));
+    async function processData(dataView: DataView, preFetchedRows?: DataViewRow[]) {
+        try {
+            const hasTime = !!(await dataView.categoricalAxis(timeAxisName));
+            const hasDescription = !!(await dataView.categoricalAxis(descriptionAxisName));
 
-        if (!hasTime) {
-            state.timeLeaves = [];
-            state.allCards = [];
-            return;
-        }
+            if (!hasTime) {
+                state.timeLeaves = [];
+                state.allCards = [];
+                state.flatNodes = [];
+                return;
+            }
 
-        state.timeLeaves = (await (await dataView.hierarchy(timeAxisName))?.root())?.leaves() || [];
-        
-        if (state.timeLeaves.length > maxTimeSegments) {
-            mod.controls.errorOverlay.show(
-                `⚠️ Dataset too large: ${state.timeLeaves.length.toLocaleString()} time segments (max: ${maxTimeSegments.toLocaleString()}).`,
-                "DataSize"
-            );
-            state.timeLeaves = [];
-            state.allCards = [];
-            return;
-        }
-        mod.controls.errorOverlay.hide("DataSize");
+            let rows = preFetchedRows;
+            if (!rows) {
+                const fetchedRows = await dataView.allRows();
+                if (fetchedRows) {
+                    rows = fetchedRows;
+                }
+            }
+            
+            if (!rows) {
+                return;
+            }
+            if (rows.length > maxTimeSegments) {
+                mod.controls.errorOverlay.show(
+                    `⚠️ Dataset too large: ${rows.length.toLocaleString()} rows (max: ${maxTimeSegments.toLocaleString()}).`,
+                    "DataSize"
+                );
+                state.timeLeaves = [];
+                state.allCards = [];
+                state.flatNodes = [];
+                return;
+            }
+            mod.controls.errorOverlay.hide("DataSize");
 
-        const timeHierarchy = await dataView.hierarchy(timeAxisName);
-        state.timeHierarchyDepth = timeHierarchy?.levels.length || 0;
-        state.hierarchyRoot = (await timeHierarchy?.root()) ?? null;
+            // 1. Build Hierarchy Optimized (Using Maps for O(1) lookup)
+            const rootMap = new Map<string, any>();
+            const hierarchyData = { name: "root", children: [] as any[] };
+            (hierarchyData as any)._map = rootMap;
 
-        if (!state.hierarchyRoot) return;
+            const getChild = (parentChildren: any[], parentMap: Map<string, any>, nodeInfo: DataViewHierarchyNode) => {
+                const rawLabel = nodeInfo.formattedValue();
+                const key = nodeInfo.key ?? `${nodeInfo.level}:${rawLabel}`;
+                let child = parentMap.get(key);
+                if (!child) {
+                    child = { 
+                        name: rawLabel, 
+                        level: nodeInfo.level,
+                        children: [], 
+                        _map: new Map(),
+                        formattedValue: () => rawLabel,
+                        mark: (op: any) => nodeInfo.mark(op)
+                    };
+                    parentChildren.push(child);
+                    parentMap.set(key, child);
+                }
+                return child;
+            };
 
-        const rawCards: any[] = [];
-        state.timeLeaves.forEach((node) => {
-            node.rows().forEach((row) => {
+            const rawCards: any[] = [];
+
+            rows.forEach(row => {
+                const leafNode = row.leafNode(timeAxisName);
+                if (!leafNode) {
+                    return;
+                }
+                const rowLeafIndex = leafNode.leafIndex ?? row.categorical(timeAxisName).leafIndex;
+                if (rowLeafIndex == null) {
+                    return;
+                }
+
+                const pathNodes: DataViewHierarchyNode[] = [];
+                let walker: DataViewHierarchyNode | undefined | null = leafNode;
+                while (walker && walker.level >= 0) {
+                    pathNodes.unshift(walker);
+                    walker = walker.parent;
+                }
+
+                let currentLevel = hierarchyData;
+                let currentMap = (hierarchyData as any)._map;
+
+                pathNodes.forEach((nodeInfo) => {
+                    const child = getChild(currentLevel.children, currentMap, nodeInfo);
+                    currentLevel = child;
+                    currentMap = child._map;
+                });
+
+                // Add leaf node data
+                (currentLevel as any).value = 1; 
+                (currentLevel as any).dataRow = row;
+                (currentLevel as any).leafIndex = rowLeafIndex;
+                (currentLevel as any).mark = (op: any) => leafNode.mark(op);
+
                 if (row.categorical(descriptionAxisName).formattedValue() != "") {
                     rawCards.push({
                         description: hasDescription ? row.categorical(descriptionAxisName).formattedValue() : "",
-                        timePosition: row.categorical(timeAxisName).leafIndex,
+                        timePosition: rowLeafIndex,
                         color: row.color(),
                         row: row
                     });
                 }
             });
-        });
-        
-        state.allCards = rawCards as Card[];
-        state.performanceMode = state.allCards.length > PERFORMANCE_MODE_THRESHOLD;
+
+            // Cleanup maps
+            const cleanupMaps = (node: any) => {
+                if (node._map) {
+                    node._map = undefined;
+                    delete node._map;
+                }
+                if (node.children) {
+                    node.children.forEach(cleanupMaps);
+                }
+            };
+            cleanupMaps(hierarchyData);
+
+            // 1. Propagate minLeafIndex up for sorting
+            const calcMinLeafIndex = (node: any): number => {
+                if (!node.children || node.children.length === 0) {
+                    return node.leafIndex ?? Number.MAX_SAFE_INTEGER;
+                }
+                let min = Number.MAX_SAFE_INTEGER;
+                node.children.forEach((child: any) => {
+                    min = Math.min(min, calcMinLeafIndex(child));
+                });
+                node.minLeafIndex = min;
+                // Sort children
+                node.children.sort((a: any, b: any) => a.minLeafIndex - b.minLeafIndex);
+                return min;
+            };
+            calcMinLeafIndex(hierarchyData);
+
+            // 2. Assign startIndex and leafCount (width)
+            let globalLeafIndex = 0;
+            const assignIndices = (node: any) => {
+                if (!node.children || node.children.length === 0) {
+                    node.startIndex = globalLeafIndex;
+                    node.leafCount = 1;
+                    globalLeafIndex++;
+                    return;
+                }
+                node.startIndex = globalLeafIndex;
+                let count = 0;
+                node.children.forEach((child: any) => {
+                    assignIndices(child);
+                    count += child.leafCount;
+                });
+                node.leafCount = count;
+            };
+            assignIndices(hierarchyData);
+
+            const timeHierarchy = await dataView.hierarchy(timeAxisName);
+            state.timeHierarchyDepth = timeHierarchy?.levels.length || 0;
+            
+            // Create D3 hierarchy
+            const root = hierarchy(hierarchyData);
+            root.sum((d: any) => d.value || 0);
+            
+            state.hierarchyRoot = root as unknown as DataViewHierarchyNode; // Type assertion for compatibility
+            
+            state.allCards = rawCards as Card[];
+            // Sort cards by time position to enable binary search rendering
+            state.allCards.sort((a, b) => a.timePosition - b.timePosition);
+            state.performanceMode = state.allCards.length > PERFORMANCE_MODE_THRESHOLD;
+            
+            // We need to calculate the partition layout here to get flatNodes with x0/x1
+            // But layout depends on window size which is in draw().
+            // However, for binary search to work, we need a stable x-axis.
+            // We'll do a preliminary partition here or just rely on leaf index for now.
+            // Actually, let's defer flatNodes creation to draw() or do it here with a virtual width.
+            // For 1M rows, we need a massive virtual canvas.
+            
+            // Let's just store the leaves for now, and build flatNodes in draw() or 
+            // better yet, build the partition here with a fixed large width and scale in draw.
+            
+            // To keep it simple and consistent with previous logic, we'll use the leaf nodes 
+            // but we need them sorted by position.
+            state.timeLeaves = root.leaves() as unknown as DataViewHierarchyNode[];
+        } catch (e) {
+            // Ignore disposed data view errors
+            if (e instanceof Error && e.message.includes("disposed")) {
+                return;
+            }
+            console.error(e);
+        }
     }
 
     async function draw() {
@@ -235,27 +419,50 @@ window.Spotfire.initialize(async (mod) => {
         const cardWidth = baseCardWidth;
         const timeSegmentMargin = cardWidth / 2;
 
+        // Calculate width per time unit
         let timeMarkerWidth = (windowSize.width - timeSegmentMargin * 2) / state.timeLeaves.length;
         timeMarkerWidth = Math.max(timeMarkerWidth, minimumTimeSegmentWidth) * state.zoomLevel;
         
         const timeSegmentsPerCard = Math.ceil((cardWidth + horizontalSpaceBetweenCards) / timeMarkerWidth);
         const timeLineTop = windowSize.height / 2 - (timelineLevelHeight * state.timeHierarchyDepth) / 2;
+        
+        // Virtual dimensions
+        const totalWidth = state.timeLeaves.length * timeMarkerWidth + timeSegmentMargin * 2;
         const drawingAreaHeight = windowSize.height - 35;
-        const drawingAreaWidth = state.timeLeaves.length * timeMarkerWidth + timeSegmentMargin * 2 - 10;
-        const timelineWidth = state.timeLeaves.length * timeMarkerWidth;
-        const timelineHeight = (state.timeHierarchyDepth + 1) * timelineLevelHeight;
+        
+        // Update container size
+        drawingLayer
+            .style("height", `${drawingAreaHeight}px`)
+            .style("width", `${totalWidth}px`)
+            .on("mousedown", mouseDownHandler)
+            .on("dblclick", doubleclickHandler);
 
+        // Viewport calculation
+        let viewportLeft = 0;
+        let viewportRight = windowSize.width;
+        if (containerElement) {
+            const scrollLeft = containerElement.scrollLeft;
+            const viewportWidth = containerElement.clientWidth;
+            const buffer = viewportWidth * VIEWPORT_BUFFER; 
+            viewportLeft = Math.max(0, scrollLeft - buffer);
+            viewportRight = scrollLeft + viewportWidth + buffer;
+            
+            state.viewportLeft = viewportLeft;
+            state.viewportRight = viewportRight;
+        }
+
+        // --- 1. Efficient Card Rendering ---
         const lastPosition = new Map<number, number>();
         let maxStackedCards = 0;
         
         state.allCards.forEach(card => {
             let vp = 0;
-            while (lastPosition.has(vp) && card.timePosition - lastPosition.get(vp)! < timeSegmentsPerCard) {
+            while (lastPosition.has(vp) && card.timePosition < lastPosition.get(vp)! + timeSegmentsPerCard) {
                 vp++;
             }
             lastPosition.set(vp, card.timePosition);
             card.verticalPosition = vp;
-            maxStackedCards = Math.max(maxStackedCards, vp + 1);
+            if (vp + 1 > maxStackedCards) maxStackedCards = vp + 1;
         });
 
         let cardSpacing = cardHeight + 4 + verticalSpaceBetweenCards;
@@ -265,38 +472,17 @@ window.Spotfire.initialize(async (mod) => {
              cardSpacing = (windowSize.height - timelineLevelHeight * state.timeHierarchyDepth - (cardHeight + 4) * 2) / (2 * Math.ceil(maxStackedCards / 2));
         }
 
-        drawingLayer
-            .style("height", `${drawingAreaHeight}px`)
-            .style("width", `${drawingAreaWidth}px`)
-            .on("mousedown", mouseDownHandler)
-            .on("dblclick", doubleclickHandler);
-
-        if (containerElement) {
-            const scrollLeft = containerElement.scrollLeft;
-            const viewportWidth = containerElement.clientWidth;
-            const bufferWidth = viewportWidth * VIEWPORT_BUFFER;
-            state.viewportLeft = Math.max(0, scrollLeft - bufferWidth - timeSegmentMargin);
-            state.viewportRight = scrollLeft + viewportWidth + bufferWidth;
-        }
-
-        const visibleCards = state.performanceMode 
-            ? state.allCards.filter(c => {
-                const left = timeSegmentMargin + c.timePosition * timeMarkerWidth - cardWidth / 2 + timeMarkerWidth / 2;
-                return (left + cardWidth) >= state.viewportLeft && left <= state.viewportRight;
-            })
-            : state.allCards;
-            
+        // Filter Visible Cards using Binary Search
+        const minVisiblePos = Math.floor((viewportLeft - timeSegmentMargin + cardWidth/2 - timeMarkerWidth/2) / timeMarkerWidth);
+        const maxVisiblePos = Math.ceil((viewportRight - timeSegmentMargin + cardWidth/2 - timeMarkerWidth/2) / timeMarkerWidth);
+        
+        const startCardIndex = findCardStartIndex(state.allCards, minVisiblePos);
+        const endCardIndex = findCardEndIndex(state.allCards, maxVisiblePos);
+        
+        const visibleCards = state.allCards.slice(startCardIndex, endCardIndex + 1);
         state.visibleCardCount = visibleCards.length;
 
-        const getCardLeft = (d: Card) => timeSegmentMargin + d.timePosition * timeMarkerWidth - cardWidth / 2 + timeMarkerWidth / 2;
-        const getCardTop = (vp: number) => {
-            let top = timeLineTop;
-            const group = vp % 2;
-            const lane = Math.floor(vp / 2);
-            if (group === 0) top = top - verticalSpaceBetweenCards - lane * cardSpacing - cardHeight;
-            else top = top + timelineLevelHeight * state.timeHierarchyDepth + lane * cardSpacing + verticalSpaceBetweenCards;
-            return top;
-        };
+        // Render Connectors
         const getConnectorTop = (vp: number) => {
             let top = timeLineTop;
             const group = vp % 2;
@@ -320,6 +506,17 @@ window.Spotfire.initialize(async (mod) => {
             .style("top", d => `${getConnectorTop(d.verticalPosition)}px`)
             .style("height", d => `${getConnectorHeight(d)}px`);
 
+        // Render Cards
+        const getCardLeft = (d: Card) => timeSegmentMargin + d.timePosition * timeMarkerWidth - cardWidth / 2 + timeMarkerWidth / 2;
+        const getCardTop = (vp: number) => {
+            let top = timeLineTop;
+            const group = vp % 2;
+            const lane = Math.floor(vp / 2);
+            if (group === 0) top = top - verticalSpaceBetweenCards - lane * cardSpacing - cardHeight;
+            else top = top + timelineLevelHeight * state.timeHierarchyDepth + lane * cardSpacing + verticalSpaceBetweenCards;
+            return top;
+        };
+
         cardContainer.selectAll(".card")
             .data(visibleCards, (d: any) => d.row.elementId(true))
             .join("div")
@@ -339,44 +536,104 @@ window.Spotfire.initialize(async (mod) => {
 
         cardContainer.selectAll(".card").filter((d: any) => d.row.isMarked()).raise();
 
+        // --- 2. Efficient Timeline Rendering ---
         timeline
             .style("left", `${timeSegmentMargin}px`)
             .style("top", `${timeLineTop}px`)
             .style("width", `${state.timeLeaves.length * timeMarkerWidth + 2}px`)
             .style("height", `${timelineLevelHeight * state.timeHierarchyDepth + 2}px`);
 
-        const rootHierarchy = hierarchy(state.hierarchyRoot);
-        rootHierarchy.sum((d: any) => (!d?.children && 1) || 0);
+        const availableLevels = Math.max(1, state.timeHierarchyDepth);
+        let maxDisplayLevel = availableLevels;
+        if (state.zoomLevel < 0.3) maxDisplayLevel = Math.min(1, availableLevels);
+        else if (state.zoomLevel < 0.6) maxDisplayLevel = Math.min(2, availableLevels);
+        else if (state.zoomLevel < 1.0) maxDisplayLevel = Math.min(3, availableLevels);
 
-        const partitionLayout = partition<DataViewHierarchyNode>()
-            .size([timelineWidth, timelineHeight])
-            .padding(0)
-            .round(false);
+        // Use D3 partition only for small datasets to preserve hierarchy view
+        if (state.timeLeaves.length < 5000) {
+             const rootHierarchy = hierarchy(state.hierarchyRoot);
+             rootHierarchy.sum((d: any) => (!d?.children && 1) || 0);
+             const partitionLayout = partition<DataViewHierarchyNode>()
+                .size([state.timeLeaves.length * timeMarkerWidth, (state.timeHierarchyDepth + 1) * timelineLevelHeight])
+                .padding(0)
+                .round(false);
+             const partitionedRoot = partitionLayout(rootHierarchy as any) as HierarchyRectangularNode<DataViewHierarchyNode>;
+             
+             const displayHierarchy = partitionedRoot.descendants().filter(d => {
+                 // Use d.depth instead of d.data.level which might be undefined
+                 return d.parent && d.depth <= maxDisplayLevel && 
+                        d.x1 >= viewportLeft - timeSegmentMargin && d.x0 <= viewportRight - timeSegmentMargin;
+             });
+             renderTimelineNodes(displayHierarchy);
+        } else {
+            // "Hyper Scale" Mode: Render visible leaves AND their ancestors
+            const startLeafIndex = Math.max(0, Math.floor((viewportLeft - timeSegmentMargin) / timeMarkerWidth));
+            const endLeafIndex = Math.min(state.timeLeaves.length - 1, Math.ceil((viewportRight - timeSegmentMargin) / timeMarkerWidth));
             
-        const partitionedRoot = partitionLayout(rootHierarchy as any) as HierarchyRectangularNode<DataViewHierarchyNode>;
+            const visibleNodes = new Map<any, any>();
 
-        let maxDisplayLevel = state.timeHierarchyDepth - 1;
-        if (state.zoomLevel < 0.3) maxDisplayLevel = Math.min(0, state.timeHierarchyDepth - 1);
-        else if (state.zoomLevel < 0.6) maxDisplayLevel = Math.min(1, state.timeHierarchyDepth - 1);
-        else if (state.zoomLevel < 1.0) maxDisplayLevel = Math.min(2, state.timeHierarchyDepth - 1);
+            const addNode = (node: any) => {
+                if (!node) return;
+                if (node.depth > maxDisplayLevel) {
+                    if (node.parent) addNode(node.parent);
+                    return;
+                }
+                if (node.depth === 0 || visibleNodes.has(node)) return;
+                
+                visibleNodes.set(node, {
+                    data: node.data,
+                    x0: node.data.startIndex * timeMarkerWidth,
+                    x1: (node.data.startIndex + node.data.leafCount) * timeMarkerWidth,
+                    y0: node.depth * timelineLevelHeight,
+                    y1: (node.depth + 1) * timelineLevelHeight,
+                    depth: node.depth
+                });
+                
+                if (node.parent) addNode(node.parent);
+            };
 
-        const displayHierarchy = partitionedRoot.descendants().filter(d => d.parent && d.data.level <= maxDisplayLevel);
+            const step = timeMarkerWidth < 2 ? Math.ceil(2 / timeMarkerWidth) : 1;
+            
+            for (let i = startLeafIndex; i <= endLeafIndex; i += step) {
+                addNode(state.timeLeaves[i]);
+            }
+            // Ensure we catch the right edge
+            if (endLeafIndex > startLeafIndex) {
+                addNode(state.timeLeaves[endLeafIndex]);
+            }
 
-        timeline.selectAll(".timeMarker")
-            .data(displayHierarchy)
-            .join("div")
-            .attr("class", "timeMarker")
-            .classed("timeMarker-left", d => d.x0 === 0)
-            .classed("timeMarker-top", d => d.data.level === 0)
-            .on("click", (e, d) => {
-                d.data.mark(e.ctrlKey || e.metaKey ? "ToggleOrAdd" : "Replace");
-                e.stopPropagation();
-            })
-            .text(d => d.data.formattedValue())
-            .style("left", d => `${d.x0}px`)
-            .style("width", d => `${d.x1 - d.x0 - 5}px`)
-            .style("top", d => `${d.y0 - timelineLevelHeight}px`)
-            .style("height", d => `${d.y1 - d.y0}px`);
+            const limitedNodes = Array.from(visibleNodes.values()).filter(n => n.depth <= maxDisplayLevel);
+            renderTimelineNodes(limitedNodes);
+        }
+
+        function renderTimelineNodes(nodes: any[]) {
+             timeline.selectAll(".timeMarker")
+                .data(nodes)
+                .join("div")
+                .attr("class", "timeMarker")
+                .classed("timeMarker-left", (d: any) => d.x0 === 0)
+                .classed("timeMarker-top", (d: any) => d.depth === 0)
+                .on("click", (e, d: any) => {
+                    const nodeData = d.data?.data ?? d.data;
+                    if(nodeData && nodeData.mark) nodeData.mark(e.ctrlKey || e.metaKey ? "ToggleOrAdd" : "Replace");
+                    e.stopPropagation();
+                })
+                .text((d: any) => {
+                    const nodeData = d.data?.data ?? d.data;
+                    if (!nodeData) return "";
+                    if (typeof nodeData.formattedValue === 'function') {
+                        const value = nodeData.formattedValue();
+                        if (value && value.trim().length > 0) {
+                            return value;
+                        }
+                    }
+                    return nodeData.name ?? "";
+                })
+                .style("left", (d: any) => `${d.x0}px`)
+                .style("width", (d: any) => `${Math.max(2, d.x1 - d.x0 - 5)}px`)
+                .style("top", (d: any) => `${d.y0 - timelineLevelHeight}px`)
+                .style("height", (d: any) => `${d.y1 - d.y0}px`);
+        }
 
         if (state.performanceMode && containerElement) {
             containerElement.removeEventListener("scroll", handleScroll);
@@ -385,7 +642,6 @@ window.Spotfire.initialize(async (mod) => {
 
         const renderTime = performance.now() - renderStartTime;
         updatePerformanceStats(renderTime);
-        
         context.signalRenderComplete();
 
         function handleScroll() {
@@ -405,7 +661,7 @@ window.Spotfire.initialize(async (mod) => {
         function scroll() {
             if (!containerElement) return;
             let currentScroll = containerElement.scrollLeft;
-            if (autoScroll && currentScroll < timelineWidth - windowSize.width) {
+            if (autoScroll && currentScroll < totalWidth - windowSize.width) {
                 containerElement.scrollLeft = currentScroll + 1;
                 setTimeout(scroll, autoScrollSpeed);
             }
@@ -515,7 +771,7 @@ window.Spotfire.initialize(async (mod) => {
  */
 export function generalErrorHandler<T extends (dataView: Spotfire.DataView, ...args: any) => any>(
     mod: Spotfire.Mod,
-    rowLimit = 50000 // Increased from 2000 to 50000 for large datasets
+    rowLimit = 1000000 // Increased to 1,000,000 for massive datasets
 ): (a: T) => T {
     return function (callback: T) {
         return async function callbackWrapper(dataView: Spotfire.DataView, ...args: any) {
@@ -547,7 +803,7 @@ export function generalErrorHandler<T extends (dataView: Spotfire.DataView, ...a
                     return;
                 }
 
-                await callback(dataView, ...args);
+                await callback(dataView, ...args, allRows);
 
                 mod.controls.errorOverlay.hide("General");
             } catch (e) {
