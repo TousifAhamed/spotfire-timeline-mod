@@ -62,6 +62,7 @@ const state = {
 window.Spotfire.initialize(async (mod) => {
     const context = mod.getRenderContext();
     const fontSize = parseInt(context.styling.general.font.fontSize.toString());
+    const debugPerformanceOverlay = new URLSearchParams(window.location.search || "").get("debugPerf") === "1";
 
     const baseCardHeight = fontSize * rowsPerCard * 1.5;
     const baseTimelineLevelHeight = fontSize * 2;
@@ -739,6 +740,11 @@ window.Spotfire.initialize(async (mod) => {
     function updatePerformanceStats(renderTime: number) {
         const perfStats = document.getElementById("performance-stats");
         if (!perfStats) return;
+        if (!debugPerformanceOverlay) {
+            perfStats.classList.remove("visible");
+            perfStats.innerHTML = "";
+            return;
+        }
 
         if (state.allCards.length > PERFORMANCE_MODE_THRESHOLD) {
             perfStats.classList.add("visible");

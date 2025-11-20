@@ -27,7 +27,7 @@ This enhanced version includes professional-grade improvements for handling **hu
 - **Intelligent Data Filtering**: Filters cards before D3 rendering for maximum efficiency
 
 **Real-Time Performance Monitoring**:
-When working with large datasets (> 5,000 cards), a performance overlay displays:
+When working with large datasets (> 5,000 cards), an optional performance overlay (enable by appending `?debugPerf=1` to the mod URL during development) displays:
 - Total Cards in dataset
 - Currently Rendered Cards
 - Culling Efficiency (% reduction)
